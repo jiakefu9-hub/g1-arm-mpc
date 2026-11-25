@@ -1,0 +1,1783 @@
+#!/usr/bin/env python3
+"""Opt-in G1 Arm SDK walk experiment with fixed-left / right-arm PID control.
+
+The robot must already be stationary and self-balancing in Regular Motion Mode
+(FSM 500).  This program never switches mode and never creates ``rt/lowcmd``.
+It publishes only ``rt/arm_sdk`` and calls only the locomotion velocity setter.
+
+Imports of Unitree SDK2 Python are deliberately delayed until the profile,
+arguments and explicit permit have passed local validation.
+"""
+
+from __future__ import annotations
+
+import argparse
+from dataclasses import dataclass
+import hashlib
+import json
+import math
+import os
+from pathlib import Path
+import queue
+import shutil
+import signal
+import sys
+import threading
+import time
+
+# This executable owns its numerical runtime. Set before importing NumPy:
+# tiny 2x2/5x5 operations do not benefit from a multi-thread BLAS pool.
+for _thread_variable in ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS"):
+    os.environ[_thread_variable] = "1"
+
+import numpy as np
+import yaml
+
+from hardware_pid_control import (
+    CONTROL_PERIOD_S,
+    PID_REFERENCE_PERIOD_S,
+    ARM_MOTOR_INDICES,
+    END_S,
+    FixedH0Heading,
+    FORWARD_SPEED_M_S,
+    HardwarePidPlan,
+    PidParameters,
+    RELEASE_START_S,
+    RightArmHardwarePid,
+    VALID_ARM_SLOTS,
+    WALK_START_S,
+    WALK_STOP_S,
+    WEIGHT_RELEASE_DURATION_S,
+    WEIGHT_MOTOR_INDEX,
+    WeightReleaseRamp,
+    locomotion_setpoint,
+    vertical_angular_rate,
+    yaw_from_quaternion,
+)
+from endpoint_pose import EndpointModel
+from pid_timing import PeriodicClock, pin_control_thread, timing_summary
+from arm_execution_record import command_evidence as execution_evidence
+from hardware_interactive_walk import PausableWalk, SpacebarInput, PROTOCOL as INTERACTIVE_WALK_PROTOCOL
+
+ROOT = Path(__file__).resolve().parents[2]
+PERMIT = "PID_WALK_H0_CAPTURE"
+SCHEMA = "g1_hardware_pid_walk_site_v1"
+# 20 ms baseline is field-tested; 6 ms is offline-prepared, awaiting a field run.
+FIELD_OUTPUT_LOCKED = True
+STATE_TIMEOUT_NS = 100_000_000
+FSM_TIMEOUT_NS = 2_500_000_000
+FSM_RPC_TIMEOUT_S = 0.3
+VELOCITY_RPC_TIMEOUT_S = 0.5
+# These are synchronous Loco RPCs, not the 6 ms arm DDS control loop.  The
+# previous 20 Hz + 20 Hz pair had increasing round-trip latency in the field;
+# robot-side queuing was not measured. A velocity request lasts at most 0.2 s,
+# so 10 Hz retains one refresh of overlap. FSM polling is startup-only at 1 Hz;
+# during output LowState/remote checks remain live but FSM changes are not polled.
+FSM_POLL_PERIOD_S = 1.0
+VELOCITY_RPC_PERIOD_S = 0.1
+STATE_SAMPLE_PERIOD_NS = 2_000_000
+LOWSTATE_JOURNAL_PERIOD_NS = 20_000_000
+IMU_JOURNAL_PERIOD_NS = 5_000_000
+ZERO_SPEED_ACK_WAIT_S = 1.0
+EXPECTED_TARGET_Q = np.deg2rad([
+    -4.0, -1.0, 0.0, -8.1, 0.0,
+    -4.0, 1.0, 0.0, -7.8, 0.0,
+    0.0, 0.0, 0.0,
+])
+REQUIRED_CONFIRMATIONS = (
+    "hardware_identity_confirmed",
+    "mapping_confirmed",
+    "weight_scope_confirmed",
+    "invalid_slots_confirmed",
+    "regular_motion_mode_confirmed",
+    "grounded_self_balance_confirmed",
+    "loss_response_plan_reviewed",
+    "normal_release_plan_reviewed",
+    "emergency_procedure_confirmed",
+    "no_competing_user_publishers_confirmed",
+    "safety_parameters_confirmed",
+    "hardware_pid_controller_confirmed",
+    "pid_parameters_confirmed",
+    "h0_metric_window_confirmed",
+)
+
+
+def close_sdk_endpoint(endpoint, endpoint_kind):
+    """Detach the CycloneDDS listener before SDK2 Python deletes its entity.
+
+    The installed Unitree SDK2 Python ``Close`` methods directly delete the
+    DataReader/DataWriter. With the current CycloneDDS binding, an active
+    listener can then keep entering ``take(1)`` while the reader is being
+    destroyed, producing repeated ``[Reader] take sample error`` messages and
+    preventing this one-shot process from returning. These private attribute
+    names are intentionally checked rather than guessed: if the installed SDK
+    layout changes, fail the close explicitly instead of touching an unknown
+    object.
+    """
+    layout = {
+        "subscriber": (
+            "_ChannelSubscriber__channel", "_Channel__reader", "_Reader__reader"
+        ),
+        "publisher": (
+            "_ChannelPublisher__channel", "_Channel__writer", "_Writer__writer"
+        ),
+    }
+    if endpoint_kind not in layout:
+        raise ValueError(f"unsupported SDK endpoint kind: {endpoint_kind}")
+    channel_attr, holder_attr, entity_attr = layout[endpoint_kind]
+    try:
+        channel = getattr(endpoint, channel_attr)
+        holder = getattr(channel, holder_attr)
+        entity = getattr(holder, entity_attr)
+    except AttributeError as exc:
+        raise RuntimeError(
+            f"Unitree SDK2 {endpoint_kind} layout changed; refusing unsafe close"
+        ) from exc
+    if entity is not None:
+        # Keep the Python callbacks alive until C has detached the listener.
+        old_listener = getattr(entity, "_listener", None)
+        entity.set_listener(None)
+        del old_listener
+    endpoint.Close()
+    return "listener_detached_then_closed" if entity is not None else "already_closed"
+
+
+def monotonic_ns():
+    return time.monotonic_ns()
+
+
+def make_arm_message(frame, state, constructor, crc, *, finalize_crc=True):
+    """Shared packet/CRC construction for the live runner and offline timing."""
+    message = constructor()
+    message.mode_pr = int(state.mode_pr)
+    message.mode_machine = int(state.mode_machine)
+    for slot in VALID_ARM_SLOTS:
+        command = message.motor_cmd[ARM_MOTOR_INDICES[slot]]
+        command.mode = 1
+        command.q = float(frame["q_rad"][slot])
+        command.dq = float(frame["dq_rad_s"][slot])
+        command.tau = 0.0
+        command.kp = float(frame["kp"][slot])
+        command.kd = float(frame["kd"][slot])
+    message.motor_cmd[WEIGHT_MOTOR_INDEX].q = float(frame["weight"])
+    if finalize_crc:
+        message.crc = crc.Crc(message)
+    return message
+
+
+def json_number(value):
+    value = float(value)
+    if math.isnan(value):
+        return "NaN"
+    if math.isinf(value):
+        return "Infinity" if value > 0 else "-Infinity"
+    return value
+
+
+def json_safe(value):
+    if isinstance(value, dict):
+        return {key: json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [json_safe(item) for item in value]
+    if isinstance(value, np.ndarray):
+        return json_safe(value.tolist())
+    if isinstance(value, (np.floating, float)):
+        return json_number(value)
+    if isinstance(value, np.integer):
+        return int(value)
+    if isinstance(value, np.bool_):
+        return bool(value)
+    return value
+
+
+def parse_bool(value):
+    lowered = str(value).strip().lower()
+    if lowered not in {"true", "false"}:
+        raise ValueError(f"expected true/false, got {value!r}")
+    return lowered == "true"
+
+
+def parse_vector(value, count, name):
+    result = np.asarray([float(item.strip()) for item in str(value).split(",")], dtype=float)
+    if result.shape != (count,) or not np.isfinite(result).all():
+        raise ValueError(f"{name} must contain {count} finite comma-separated values")
+    return result
+
+
+def load_profile(path: Path, controller_kind="pid"):
+    if controller_kind not in {"pid", "mpc"}:
+        raise ValueError("unsupported controller profile")
+    values = {}
+    for line_number, raw in enumerate(path.read_text().splitlines(), 1):
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "=" not in line:
+            raise ValueError(f"profile line {line_number} is not key=value")
+        key, value = (part.strip() for part in line.split("=", 1))
+        if key in values:
+            raise ValueError(f"duplicate profile key: {key}")
+        values[key] = value
+    required_text = (
+        "schema", "robot_id", "model_name", "joint_layout", "confirmed_by",
+        "loco_service", "profile_status",
+    )
+    confirmations = tuple(name.replace("pid", controller_kind) for name in REQUIRED_CONFIRMATIONS)
+    schema = SCHEMA.replace("pid", controller_kind)
+    missing = [name for name in (*required_text, *confirmations) if name not in values]
+    if missing:
+        raise ValueError(f"profile missing keys: {', '.join(missing)}")
+    if values["schema"] != schema:
+        raise ValueError(f"profile schema must be {schema}")
+    if values["profile_status"] != "FIELD_REVIEWED":
+        raise ValueError("profile_status must be FIELD_REVIEWED")
+    if values["robot_id"] in {"", "UNSET"} or values["model_name"] in {"", "UNSET"}:
+        raise ValueError("robot_id and model_name must be field-reviewed values")
+    if values["confirmed_by"] in {"", "UNSET"}:
+        raise ValueError("confirmed_by must identify the field reviewer")
+    if values["loco_service"] != "sport":
+        raise ValueError("this field tool accepts only the reviewed sport service")
+    if values["joint_layout"] != "g1_23_arm5":
+        raise ValueError("only the confirmed G1 23DoF Arm5 mapping is accepted")
+    for name in confirmations:
+        if not parse_bool(values[name]):
+            raise ValueError(f"{name} must be true")
+    if parse_bool(values.get("synthetic_fixture", "false")):
+        raise ValueError("synthetic profiles are never accepted for output")
+    if int(values.get("required_fsm", -1)) != 500:
+        raise ValueError("required_fsm must be 500")
+    valid_slots = tuple(int(value) for value in values.get("valid_slots", "").split(","))
+    if valid_slots != VALID_ARM_SLOTS or values.get("invalid_slot_policy") != "zero":
+        raise ValueError("Arm5 slots must be exactly 0..10 and invalid slots must be zero")
+    target_q = parse_vector(values.get("target_q", ""), 13, "target_q")
+    if not np.allclose(target_q, EXPECTED_TARGET_Q, atol=1e-12, rtol=0.0):
+        raise ValueError("target_q must match the established world-upright A3 pose")
+    kp = parse_vector(values.get("kp", ""), 13, "kp")
+    kd = parse_vector(values.get("kd", ""), 13, "kd")
+    if not np.array_equal(kp, np.r_[np.full(11, 20.0), 0.0, 0.0]):
+        raise ValueError("kp must be 20 on valid Arm5 slots and zero on invalid slots")
+    if not np.array_equal(kd, np.r_[np.full(11, 1.0), 0.0, 0.0]):
+        raise ValueError("kd must be 1 on valid Arm5 slots and zero on invalid slots")
+    limit_key = f"{controller_kind}_q_offset_limit_deg"
+    q_limit = parse_vector(values.get(limit_key, ""), 5, limit_key)
+    if np.any(q_limit <= 0.0) or np.any(q_limit > 5.0):
+        raise ValueError("q-reference offsets must be in (0,5] degrees")
+    # Keep old reviewed PID profiles readable; the executable period is 6 ms,
+    # never the historical 20 ms profile value. New profiles explicitly say 6.
+    declared_period = float(values.get("control_period_ms", "nan"))
+    allowed_periods = {6.0, 20.0} if controller_kind == "pid" else {6.0}
+    if declared_period not in allowed_periods:
+        raise ValueError(f"control_period_ms must be one of {sorted(allowed_periods)}")
+    expected = {
+        "max_weight": 1.0,
+        "weight_rate_per_s": 1.0 / 3.0,
+        "state_timeout_ms": 100.0,
+        "startup_wait_s": 5.0,
+        "startup_valid_samples": 50.0,
+        "walk_start_s": WALK_START_S,
+        "walk_stop_s": WALK_STOP_S,
+        "release_start_s": RELEASE_START_S,
+        "end_s": END_S,
+        "forward_speed_m_s": FORWARD_SPEED_M_S,
+    }
+    for name, expected_value in expected.items():
+        actual = float(values.get(name, "nan"))
+        if not math.isclose(actual, expected_value, rel_tol=0.0, abs_tol=1e-12):
+            raise ValueError(f"{name} must be {expected_value}")
+    return {
+        **values,
+        "target_q_array": target_q,
+        "kp_array": kp,
+        "kd_array": kd,
+        "pid_q_offset_limit_deg_array": q_limit,
+        "q_offset_limit_deg_array": q_limit,
+        "startup_valid_samples_int": int(float(values["startup_valid_samples"])),
+    }
+
+
+def load_pid_parameters(config_path: Path, profile):
+    config = yaml.safe_load(config_path.read_text())
+    selected = {
+        name: config[name]
+        for name in (
+            "pid_kp_pose", "pid_kd_pose", "pid_ki_pose", "pid_posture_gain",
+            "pid_finite_diff_eps", "pid_damping", "pid_integral_limit",
+            "pid_max_dq", "pid_de_g_alpha", "hardware_pid_max_dq",
+            "hardware_pid_max_ddq",
+        )
+    }
+    selected["pid_q_offset_limit_deg"] = profile["pid_q_offset_limit_deg_array"].tolist()
+    # Only the explicit reviewed zero-position trial supplies these overrides.
+    # Keep shared model parameters and legacy/default PID behavior unchanged.
+    selected.update(profile.get('position_pid_parameter_overrides', {}))
+    return PidParameters.from_mapping(selected), selected
+
+
+class Journal:
+    snapshot = staticmethod(json_safe)
+    format_row = staticmethod(lambda row: json.dumps(row, allow_nan=False, separators=(",", ":")) + "\n")
+
+    def __init__(self, output_dir: Path):
+        output_dir.mkdir(parents=True, exist_ok=False)
+        self.output_dir = output_dir
+        self._stream = (output_dir / "raw.jsonl").open("x", buffering=1)
+        self._queue = queue.Queue(maxsize=65536)
+        self.failed = threading.Event()
+        self.dropped = 0
+        self.written = 0
+        self._closed = False
+        self._closing = threading.Event()
+        self._state_lock = threading.Lock()
+        self.failure_reason = None
+        self._thread = threading.Thread(target=self._run, name="pid_journal", daemon=True)
+        self._thread.start()
+
+    def record(self, row):
+        row = dict(row)
+        row.setdefault("monotonic_ns", monotonic_ns())
+        row = self.snapshot(row)
+        with self._state_lock:
+            if self._closing.is_set():
+                self.dropped += 1
+                self._fail("record attempted after recorder shutdown began")
+                return
+            try:
+                self._queue.put_nowait(row)
+            except queue.Full:
+                self.dropped += 1
+                self._fail("recorder queue overflow")
+
+    def _fail(self, reason):
+        self.failure_reason = self.failure_reason or str(reason)
+        self.failed.set()
+
+    def _run(self):
+        try:
+            while True:
+                try:
+                    row = self._queue.get(timeout=0.05)
+                except queue.Empty:
+                    # A producer may enqueue after get() timed out, just
+                    # before close() sets the flag. Recheck under the same
+                    # lock as record/close so that accepted tail is drained.
+                    with self._state_lock:
+                        if self._closing.is_set() and self._queue.empty():
+                            break
+                    continue
+                try:
+                    self._stream.write(self.format_row(row))
+                    self.written += 1
+                finally:
+                    self._queue.task_done()
+        except Exception as exc:
+            self._fail(f"recorder write failed: {exc}")
+        finally:
+            # The writer owns flushing/closing. If disk I/O blocks, close()
+            # may time out, but must not close a stream beneath a live writer.
+            try:
+                self._stream.close()
+            except Exception as exc:
+                self._fail(f"recorder close failed: {exc}")
+
+    def close(self, timeout_s=5.0):
+        """Drain normally; never wait forever on a failed or blocked writer.
+
+        A timeout is an explicit failed capture, not a successful flush. The
+        daemon writer may still finish later; this is not durable-storage proof.
+        """
+        if not math.isfinite(timeout_s) or timeout_s < 0:
+            raise ValueError("recorder close timeout must be finite and nonnegative")
+        if self._closed:
+            return not self.failed.is_set()
+        with self._state_lock:
+            self._closing.set()
+        self._thread.join(timeout_s)
+        if self._thread.is_alive():
+            self._fail("recorder shutdown timed out; capture may be incomplete")
+        self._closed = True
+        return not self.failed.is_set()
+
+
+class Interlock:
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._fault = None
+        self._release_fault = None
+        self._fsm_request_ns = None
+        self._fsm_observed_ns = None
+        self._fsm_freshness_required = True
+        self._last_tick = None
+
+    def trip(self, reason, *, release_blocking=True):
+        with self._lock:
+            if self._fault is None:
+                self._fault = str(reason)
+            if release_blocking and self._release_fault is None:
+                self._release_fault = str(reason)
+
+    def observe_tick(self, tick):
+        tick = int(tick) & 0xFFFFFFFF
+        with self._lock:
+            if self._last_tick is not None:
+                delta = (tick - self._last_tick) & 0xFFFFFFFF
+                if delta >= 0x80000000:
+                    self._fault = self._fault or "LowState tick rollback"
+                    self._release_fault = self._release_fault or "LowState tick rollback"
+            self._last_tick = tick
+
+    def observe_remote(self, remote):
+        if len(remote) > 3:
+            keys = int(remote[2]) | (int(remote[3]) << 8)
+            if keys & ((1 << 5) | (1 << 9)) == ((1 << 5) | (1 << 9)):
+                self.trip("remote L2+B observed")
+
+    def observe_fsm(self, rc, value, request_ns, reply_ns):
+        with self._lock:
+            if rc != 0:
+                # A single RPC packet may time out under host load.  Keep the
+                # last successful observation; check() still trips fail-closed
+                # if no fresh FSM=500 reply arrives within FSM_TIMEOUT_NS.
+                return
+            elif value != 500:
+                self._fault = self._fault or f"left required FSM 500: FSM={value}"
+                self._release_fault = self._release_fault or f"left required FSM 500: FSM={value}"
+            elif request_ns <= 0 or reply_ns < request_ns or reply_ns - request_ns > FSM_TIMEOUT_NS:
+                self._fault = self._fault or "invalid or late FSM reply"
+                self._release_fault = self._release_fault or "invalid or late FSM reply"
+            elif self._fsm_request_ns is not None and request_ns <= self._fsm_request_ns:
+                self._fault = self._fault or "non-monotonic FSM observation"
+                self._release_fault = self._release_fault or "non-monotonic FSM observation"
+            else:
+                self._fsm_request_ns = request_ns
+                # Freshness begins when the successful observation becomes
+                # available to this process. Counting from request start makes
+                # a valid slow RPC consume its own entire freshness budget and
+                # can reject a reply immediately after it was received.
+                self._fsm_observed_ns = reply_ns
+
+    def latch_valid_fsm(self):
+        """Keep a twice-validated FSM=500 result without runtime RPC polling."""
+        with self._lock:
+            if self._fault is not None or self._fsm_observed_ns is None:
+                return False
+            self._fsm_freshness_required = False
+            return True
+
+    def check(self, now_ns=None):
+        with self._lock:
+            # Sample the live clock while the FSM snapshot is locked. A newer
+            # worker reply must not be compared to a loop-entry timestamp from
+            # before it arrived. Explicit timestamps remain for offline tests.
+            now_ns = monotonic_ns() if now_ns is None else int(now_ns)
+            if self._fault:
+                return self._fault
+            if self._fsm_observed_ns is None:
+                return "FSM not yet observed"
+            if self._fsm_freshness_required and (
+                now_ns < self._fsm_observed_ns
+                or now_ns - self._fsm_observed_ns > FSM_TIMEOUT_NS
+            ):
+                self._fault = "FSM observation stale or future"
+                return self._fault
+            return ""
+
+    def check_release(self):
+        """Allow bounded hand-back after query/compute failure, never takeover.
+
+        The separate latch matters: an earlier soft fault must not hide a later
+        remote stop, observed mode exit or tick rollback. LowState validity and
+        transport health are checked independently by the release loop.
+        """
+        with self._lock:
+            if self._release_fault:
+                return self._release_fault
+            if self._fsm_observed_ns is None:
+                return "FSM never validated"
+            if monotonic_ns() < self._fsm_observed_ns:
+                return "FSM observation in future"
+            return ""
+
+
+@dataclass(frozen=True)
+class LowSnapshot:
+    received_ns: int
+    sequence: int
+    tick: int
+    mode_pr: int
+    mode_machine: int
+    q: np.ndarray
+    dq: np.ndarray
+    crc_valid: bool
+    tau_est: np.ndarray | None = None
+    ddq_raw: np.ndarray | None = None
+
+
+@dataclass(frozen=True)
+class ImuSnapshot:
+    received_ns: int
+    sequence: int
+    quaternion: np.ndarray
+    rpy: np.ndarray
+    gyro: np.ndarray
+    accelerometer: np.ndarray
+
+
+class Streams:
+    def __init__(self, journal, interlock, crc, observer=None):
+        self.journal = journal
+        self.interlock = interlock
+        self.crc = crc
+        self.observer = observer
+        self.lock = threading.Lock()
+        self.low = None
+        self.imu = None
+        self.low_sequence = 0
+        self.imu_sequence = 0
+        self.low_sample_ns = 0
+        self.imu_sample_ns = 0
+        self.low_journal_ns = 0
+        self.imu_journal_ns = 0
+        self.epoch_ns = None
+        self.heading = FixedH0Heading()
+
+    @staticmethod
+    def _imu_fields(message):
+        return {
+            "quaternion_wxyz": [float(value) for value in message.quaternion],
+            "rpy_rad": [float(value) for value in message.rpy],
+            "gyroscope_rad_s": [float(value) for value in message.gyroscope],
+            "accelerometer_raw_m_s2": [float(value) for value in message.accelerometer],
+            "temperature_raw": int(message.temperature),
+        }
+
+    def low_callback(self, message):
+        now = monotonic_ns()
+        if now - self.low_sample_ns < STATE_SAMPLE_PERIOD_NS:
+            return
+        self.low_sample_ns = now
+        self.low_sequence += 1
+        crc_valid = False
+        try:
+            crc_valid = int(self.crc.Crc(message)) == int(message.crc)
+        except Exception:
+            pass
+        q = np.asarray([float(motor.q) for motor in message.motor_state], dtype=float)
+        dq = np.asarray([float(motor.dq) for motor in message.motor_state], dtype=float)
+        tau_est = np.asarray([float(motor.tau_est) for motor in message.motor_state], dtype=float)
+        ddq_raw = np.asarray([float(motor.ddq) for motor in message.motor_state], dtype=float)
+        remote = [int(value) for value in message.wireless_remote]
+        snapshot = LowSnapshot(now, self.low_sequence, int(message.tick),
+                               int(message.mode_pr), int(message.mode_machine), q, dq, crc_valid,
+                               tau_est, ddq_raw)
+        if crc_valid:
+            self.interlock.observe_tick(message.tick)
+            self.interlock.observe_remote(remote)
+        with self.lock:
+            self.low = snapshot
+        if self.observer is not None and crc_valid:
+            try:
+                self.observer.observe_low(now, q, dq)
+            except Exception as exc:
+                self.interlock.trip(f"controller LowState observer: {exc}", release_blocking=False)
+        if now - self.low_journal_ns < LOWSTATE_JOURNAL_PERIOD_NS:
+            return
+        self.low_journal_ns = now
+        self.journal.record({
+            "schema": "g1_lowstate_raw_v1", "topic": "rt/lowstate",
+            "received_monotonic_ns": now,
+            "host_callback_sequence": self.low_sequence,
+            "tick_raw": int(message.tick), "mode_pr": int(message.mode_pr),
+            "mode_machine": int(message.mode_machine), "crc_raw": int(message.crc),
+            "crc_valid": crc_valid, "wireless_remote_bytes": remote,
+            "version": [int(value) for value in message.version],
+            "reserve": [int(value) for value in message.reserve],
+            "pelvis_imu": self._imu_fields(message.imu_state),
+            "motors": [{
+                "index": index, "mode": int(motor.mode), "q_rad": json_number(motor.q),
+                "dq_rad_s": json_number(motor.dq), "ddq_raw_rad_s2": json_number(motor.ddq),
+                "tau_est_nm": json_number(motor.tau_est),
+                "temperature_raw": [int(value) for value in motor.temperature],
+                "vol_raw": json_number(motor.vol),
+                "sensor_raw": [int(value) for value in motor.sensor],
+                "motorstate_raw": int(motor.motorstate),
+            } for index, motor in enumerate(message.motor_state)],
+        })
+
+    def imu_callback(self, message):
+        now = monotonic_ns()
+        if now - self.imu_sample_ns < STATE_SAMPLE_PERIOD_NS:
+            return
+        self.imu_sample_ns = now
+        self.imu_sequence += 1
+        fields = self._imu_fields(message)
+        snapshot = ImuSnapshot(
+            now, self.imu_sequence,
+            np.asarray(fields["quaternion_wxyz"], dtype=float),
+            np.asarray(fields["rpy_rad"], dtype=float),
+            np.asarray(fields["gyroscope_rad_s"], dtype=float),
+            np.asarray(fields["accelerometer_raw_m_s2"], dtype=float),
+        )
+        with self.lock:
+            self.imu = snapshot
+            epoch = self.epoch_ns
+            if epoch is not None:
+                task_s = (now - epoch) * 1e-9
+                self.heading.observe(
+                    now, task_s, yaw_from_quaternion(snapshot.quaternion),
+                    vertical_angular_rate(snapshot.rpy, snapshot.gyro),
+                )
+        if self.observer is not None:
+            try:
+                self.observer.observe_imu(
+                    now, snapshot.quaternion, snapshot.gyro, snapshot.accelerometer)
+            except Exception as exc:
+                self.interlock.trip(f"controller IMU observer: {exc}", release_blocking=False)
+        if now - self.imu_journal_ns < IMU_JOURNAL_PERIOD_NS:
+            return
+        self.imu_journal_ns = now
+        self.journal.record({
+            "schema": "g1_torso_imu_raw_v1", "topic": "rt/secondary_imu",
+            "received_monotonic_ns": now,
+            "host_callback_sequence": self.imu_sequence,
+            "source_timestamp_available": False, **fields,
+        })
+
+    def latest(self):
+        with self.lock:
+            return self.low, self.imu
+
+    def set_epoch(self, epoch_ns):
+        with self.lock:
+            self.epoch_ns = int(epoch_ns)
+            if self.imu is not None:
+                task_s = (self.imu.received_ns - self.epoch_ns) * 1e-9
+                self.heading.observe(
+                    self.imu.received_ns, task_s,
+                    yaw_from_quaternion(self.imu.quaternion),
+                    vertical_angular_rate(self.imu.rpy, self.imu.gyro),
+                )
+
+    def heading_current(self):
+        with self.lock:
+            return self.heading.current()
+
+    def freeze_heading(self):
+        with self.lock:
+            return self.heading.freeze(), self.heading.current()
+
+
+def finite_array(array):
+    return np.isfinite(np.asarray(array, dtype=float)).all()
+
+
+def health(streams, interlock, journal, now_ns=None):
+    # Immutable snapshots first, then validation time: callbacks may advance
+    # streams between any two statements, without making data truly future.
+    low, imu = streams.latest()
+    stop = interlock.check(now_ns)
+    now_ns = monotonic_ns() if now_ns is None else int(now_ns)
+    if stop:
+        return stop
+    if journal.failed.is_set() or journal.dropped:
+        return "raw recorder failure/queue overflow"
+    if low is None or now_ns < low.received_ns or now_ns - low.received_ns > STATE_TIMEOUT_NS:
+        return "LowState unavailable/stale/future"
+    if not low.crc_valid:
+        return "LowState CRC invalid"
+    if len(low.q) <= WEIGHT_MOTOR_INDEX or not finite_array(
+        [low.q[index] for index in ARM_MOTOR_INDICES[:11]]
+    ) or not finite_array([low.dq[index] for index in ARM_MOTOR_INDICES[:11]]):
+        return "LowState motor data invalid"
+    if imu is None or now_ns < imu.received_ns or now_ns - imu.received_ns > STATE_TIMEOUT_NS:
+        return "torso IMU unavailable/stale/future"
+    if not all(finite_array(value) for value in
+               (imu.quaternion, imu.rpy, imu.gyro, imu.accelerometer)):
+        return "torso IMU nonfinite"
+    norm = np.linalg.norm(imu.quaternion)
+    if not 0.5 < norm < 1.5:
+        return "torso IMU quaternion invalid"
+    return ""
+
+
+def startup_gate(streams, interlock, journal, after_sequence, required_samples, wait_s=5.0):
+    deadline = time.monotonic() + wait_s
+    previous = int(after_sequence)
+    consecutive = 0
+    while time.monotonic() < deadline:
+        low, _ = streams.latest()
+        if low is not None and low.sequence > previous:
+            previous = low.sequence
+            if not health(streams, interlock, journal):
+                consecutive += 1
+                if consecutive >= required_samples:
+                    return low
+            else:
+                consecutive = 0
+        time.sleep(0.001)
+    raise RuntimeError("fresh consecutive FSM-500/LowState/torso samples unavailable")
+
+
+def _arm_slots(snapshot):
+    return np.asarray([snapshot.q[index] for index in ARM_MOTOR_INDICES], dtype=float)
+
+
+def _arm_dq(snapshot):
+    return np.asarray([snapshot.dq[index] for index in ARM_MOTOR_INDICES], dtype=float)
+
+
+def run_device(args, profile, pid_parameters, pid_mapping, journal, runtime=None):
+    """Shared field transport/interlocks; MPC hooks own computation only.
+
+    The default PID path and robot mode/output boundaries stay unchanged.
+    Runtime loading/warm-up must finish before this function.
+    """
+    if runtime is not None and (getattr(runtime, "actuation", "reference_servo") != "reference_servo"
+                                or getattr(runtime.controller, "offline_only", False)):
+        authorize = getattr(runtime, 'validate_field_entry', None)
+        if authorize is None:
+            raise ValueError("offline-only torque candidate cannot enter run_device")
+        authorize()
+    controller_label = ("PID" if runtime is None else
+                        getattr(runtime, "controller_label", "MPC"))
+    # Delayed imports: reaching this point still has not initialized DDS.
+    import unitree_sdk2py
+    from unitree_sdk2py.core.channel import ChannelFactoryInitialize, ChannelPublisher, ChannelSubscriber
+    from unitree_sdk2py.g1.loco.g1_loco_api import (
+        LOCO_API_VERSION, LOCO_SERVICE_NAME,
+        ROBOT_API_ID_LOCO_GET_FSM_ID, ROBOT_API_ID_LOCO_SET_VELOCITY,
+    )
+    from unitree_sdk2py.idl.default import unitree_hg_msg_dds__LowCmd_
+    from unitree_sdk2py.idl.unitree_hg.msg.dds_ import IMUState_, LowCmd_, LowState_
+    from unitree_sdk2py.rpc.client import Client
+    from unitree_sdk2py.utils.crc import CRC
+
+    sdk_root = Path(unitree_sdk2py.__file__).resolve().parent
+    sdk_files = [
+        sdk_root / "core/channel.py",
+        sdk_root / "rpc/client.py",
+        sdk_root / "rpc/client_base.py",
+        sdk_root / "utils/crc.py",
+        sdk_root / "g1/loco/g1_loco_api.py",
+        sdk_root / "idl/unitree_hg/msg/dds_/_LowCmd_.py",
+        sdk_root / "idl/unitree_hg/msg/dds_/_LowState_.py",
+    ]
+    journal.record({
+        "schema": "g1_pid_event_v1", "event": "unitree_sdk2_python_provenance",
+        "package_root": str(sdk_root),
+        "critical_file_sha256": {
+            str(path.relative_to(sdk_root)): hashlib.sha256(path.read_bytes()).hexdigest()
+            for path in sdk_files
+        },
+    })
+
+    class LocoClient(Client):
+        def __init__(self):
+            super().__init__(LOCO_SERVICE_NAME, False)
+            self.SetTimeout(max(FSM_RPC_TIMEOUT_S, VELOCITY_RPC_TIMEOUT_S))
+            self._SetApiVerson(LOCO_API_VERSION)
+            self._RegistApi(ROBOT_API_ID_LOCO_GET_FSM_ID, 0)
+            self._RegistApi(ROBOT_API_ID_LOCO_SET_VELOCITY, 0)
+
+        def get_fsm(self):
+            code, raw = self._Call(ROBOT_API_ID_LOCO_GET_FSM_ID, "{}")
+            value = -1
+            if code == 0:
+                value = int(json.loads(raw)["data"])
+            return code, value, raw
+
+        def send_velocity(self, vx, wz, duration):
+            payload = json.dumps({"velocity": [float(vx), 0.0, float(wz)],
+                                  "duration": float(duration)})
+            code, raw = self._Call(ROBOT_API_ID_LOCO_SET_VELOCITY, payload)
+            return code, raw
+
+    interlock = Interlock()
+    crc = runtime.create_crc() if runtime is not None and hasattr(runtime,'create_crc') else CRC()
+    streams = Streams(journal, interlock, crc, observer=runtime)
+    low_subscriber = imu_subscriber = None
+    worker_stop = threading.Event()
+    fsm_poll_stop = threading.Event()
+    # Both APIs are served by the same Unitree Loco service.  Two outstanding
+    # synchronous RPCs can make both clients time out even though DDS state is
+    # healthy, so serialize the calls while leaving the 6 ms arm loop separate.
+    loco_rpc_lock = threading.Lock()
+    fsm_client = fsm_thread = None
+
+    def query_fsm_once():
+        with loco_rpc_lock:
+            begin = monotonic_ns()
+            try:
+                rc, value, raw = fsm_client.get_fsm()
+            except Exception as exc:
+                rc, value, raw = -1, -1, repr(exc)
+            end = monotonic_ns()
+        journal.record({
+            "schema": "g1_pid_event_v1", "event": "fsm_reply",
+            "request_ns": begin, "reply_ns": end, "return_code": rc,
+            "fsm_id": value, "raw_reply": raw,
+        })
+        interlock.observe_fsm(rc, value, begin, end)
+        return rc, value
+
+    def fsm_worker():
+        try:
+            while not worker_stop.is_set() and not fsm_poll_stop.is_set():
+                query_fsm_once()
+                fsm_poll_stop.wait(FSM_POLL_PERIOD_S)
+        except Exception as exc:
+            interlock.trip(f"FSM worker exception: {exc}", release_blocking=False)
+
+    publisher = None
+    publisher_transport_failed = False
+    velocity_thread = None
+    velocity_failed = threading.Event()
+    velocity_ready = threading.Event()
+    task_started = threading.Event()
+    last_zero_reply_ns = 0
+    last_zero_lock = threading.Lock()
+    stop_requested = threading.Event()
+    last_frame = None
+    last_state = None
+    sequence = 0
+    original_affinity = set(os.sched_getaffinity(0))
+    cycle_timings = []
+    interactive_walk = PausableWalk() if getattr(args, 'space_pause_walk', False) else None
+    keyboard = keyboard_thread = None
+    velocity_wakeup = threading.Event() if interactive_walk is not None else None
+    epoch_ns = None
+
+    def request_stop(_signal=None, _frame=None):
+        stop_requested.set()
+        if velocity_wakeup is not None:
+            velocity_wakeup.set()
+
+    previous_sigint = previous_sigterm = None
+
+    def make_message(frame, state):
+        if runtime is not None and hasattr(runtime, 'make_message'):
+            return runtime.make_message(frame, state, unitree_hg_msg_dds__LowCmd_, crc)
+        return make_arm_message(frame, state, unitree_hg_msg_dds__LowCmd_, crc)
+
+    def fallback_weight_release(reason):
+        """Best-effort three-second release for catchable software faults.
+
+        Query/compute failure triggers release without waiting for a Loco reply.
+        It refuses to publish after observed mode exit/remote stop, stale or
+        invalid LowState, or a DDS write failure. In those cases continuing
+        to command the arm could fight the robot's own damping/mode transition.
+        No path in this helper sends a one-frame weight-zero command.
+        """
+        nonlocal sequence, publisher_transport_failed
+        if publisher_transport_failed:
+            return {
+                "attempted": False,
+                "completed": False,
+                "reason": "arm DDS write failed; further arm output disabled",
+            }
+        if publisher is None or last_frame is None or last_state is None:
+            return {
+                "attempted": False,
+                "completed": False,
+                "reason": "no previously written arm frame",
+            }
+        start_weight = float(last_frame["weight"])
+        frozen = {
+            "q_rad": np.asarray(last_frame["q_rad"], dtype=float).copy(),
+            "dq_rad_s": np.zeros(13),
+            "kp": np.asarray(last_frame["kp"], dtype=float).copy(),
+            "kd": np.asarray(last_frame["kd"], dtype=float).copy(),
+        }
+        start_ns = monotonic_ns()
+        release_start_ns = start_ns
+        release_ramp = WeightReleaseRamp(start_weight, CONTROL_PERIOD_S)
+        release_clock = PeriodicClock(start_ns, CONTROL_PERIOD_S)
+        attempted = False
+        with last_zero_lock:
+            zero_acknowledged = last_zero_reply_ns >= start_ns
+        journal.record({
+            "schema": "g1_pid_event_v1", "event": "fault_weight_release_started",
+            "reason": str(reason), "start_weight": start_weight,
+            "duration_s": WEIGHT_RELEASE_DURATION_S,
+            "zero_velocity_acknowledged": zero_acknowledged,
+            "zero_velocity_ack_wait_s": 0.0,
+            "release_independent_of_loco_ack": True,
+        })
+        while True:
+            release_clock.wait()
+            low, _ = streams.latest()
+            interlock_reason = interlock.check_release()
+            loop_ns = monotonic_ns()
+            if interlock_reason:
+                return {
+                    "attempted": attempted,
+                    "completed": False,
+                    "reason": f"interlock during release: {interlock_reason}",
+                }
+            if (
+                low is None or not low.crc_valid or loop_ns < low.received_ns
+                or loop_ns - low.received_ns > STATE_TIMEOUT_NS
+                or len(low.q) <= WEIGHT_MOTOR_INDEX or len(low.dq) <= WEIGHT_MOTOR_INDEX
+                or not finite_array(_arm_slots(low)) or not finite_array(_arm_dq(low))
+                or (low.mode_pr, low.mode_machine) != (last_state.mode_pr, last_state.mode_machine)
+            ):
+                return {
+                    "attempted": attempted,
+                    "completed": False,
+                    "reason": "fresh valid unchanged-mode LowState unavailable during release",
+                }
+            elapsed_s = (loop_ns - release_start_ns) * 1e-9
+            weight, terminal = release_ramp.sample(elapsed_s)
+            release_stage = "fault_arm_release"
+            frame = {**frozen, "weight": weight}
+            attempted = True
+            write_begin_ns = monotonic_ns()
+            try:
+                message = make_message(frame, low)
+                ok = bool(publisher.Write(message))
+            except Exception as exc:
+                publisher_transport_failed = True
+                return {
+                    "attempted": True,
+                    "completed": False,
+                    "reason": f"DDS write exception during release: {exc}",
+                }
+            write_end_ns = monotonic_ns()
+            if not ok:
+                publisher_transport_failed = True
+            sequence += 1
+            journal.record({
+                "schema": "g1_hardware_pid_command_v1",
+                "event": "dds_write" if ok else "dds_write_failed",
+                "sequence": sequence,
+                "task_elapsed_s": None,
+                "stage": release_stage,
+                "release_reason": str(reason),
+                "release_elapsed_s": elapsed_s,
+                "weight": weight,
+                "q_command_rad": frame["q_rad"].tolist(),
+                "dq_command_rad_s": frame["dq_rad_s"].tolist(),
+                "kp_command": frame["kp"].tolist(),
+                "kd_command": frame["kd"].tolist(),
+                "state_received_monotonic_ns": low.received_ns,
+                "q_measured_rad": _arm_slots(low).tolist(),
+                "dq_measured_rad_s": _arm_dq(low).tolist(),
+                "write_begin_monotonic_ns": write_begin_ns,
+                "write_end_monotonic_ns": write_end_ns,
+                "write_duration_us": (write_end_ns - write_begin_ns) * 1e-3,
+                **execution_evidence(message, low),
+            })
+            if not ok:
+                return {
+                    "attempted": True,
+                    "completed": False,
+                    "reason": "DDS write failed during release",
+                }
+            if runtime is not None and hasattr(runtime, 'accept_packet'):
+                runtime.accept_packet(frame, message)
+            if terminal:
+                return {
+                    "attempted": True,
+                    "completed": True,
+                    "reason": "three-second release completed",
+                    "duration_s": elapsed_s,
+                    "final_weight": weight,
+                }
+            release_clock.advance(monotonic_ns())
+
+    try:
+        ChannelFactoryInitialize(0, args.nic)
+        low_subscriber = ChannelSubscriber("rt/lowstate", LowState_)
+        imu_subscriber = ChannelSubscriber("rt/secondary_imu", IMUState_)
+        low_subscriber.Init(streams.low_callback, 0)
+        imu_subscriber.Init(streams.imu_callback, 0)
+        try:
+            fsm_client = LocoClient()
+        except Exception as exc:
+            # Preserve the established audit event for failures while
+            # registering the velocity API, now that one client owns both
+            # Loco calls.
+            journal.record({
+                "schema": "g1_pid_event_v1", "event": "velocity_exception",
+                "reason": repr(exc),
+            })
+            raise
+        fsm_thread = threading.Thread(target=fsm_worker, name="pid_fsm", daemon=True)
+        fsm_thread.start()
+        previous_sigint = signal.signal(signal.SIGINT, request_stop)
+        previous_sigterm = signal.signal(signal.SIGTERM, request_stop)
+        initial = startup_gate(
+            streams, interlock, journal, 0, profile["startup_valid_samples_int"]
+        )
+        # Continuous GetFsmId calls share the synchronous Unitree Loco service
+        # with SetVelocity; field calls timed out, but the side causing delay
+        # is not identified. Stop polling before operator dwell; perform one final
+        # explicit FSM=500 check immediately after typed confirmation instead.
+        fsm_poll_stop.set()
+        fsm_thread.join(FSM_RPC_TIMEOUT_S + 0.5)
+        if fsm_thread.is_alive():
+            raise RuntimeError("FSM startup observer did not stop")
+        continuous_stationary_hold = bool(
+            runtime is not None
+            and getattr(runtime, "continuous_stationary_hold", False)
+        )
+        if continuous_stationary_hold:
+            print(
+                f"REAL {controller_label} OUTPUT: 3 s arm entry, then continuous "
+                "stationary control until one Ctrl+C; Ctrl+C starts >=3 s gradual "
+                "arm release. Robot must already be stationary in FSM 500."
+            )
+        elif interactive_walk is not None:
+            print(
+                f"REAL {controller_label} M10 OUTPUT: 3 s arm entry, 2 s baseline, "
+                "20 s accumulated forward requests at 0.5 m/s. Tap SPACE to pause/resume; "
+                "paused arms keep live control. After 20 s: 3 s stop-settle, then gradual release. "
+                "Ctrl+C ends the run with gradual release. Robot must already be in FSM 500."
+            )
+        else:
+            print(
+                f"REAL {controller_label} OUTPUT: 3 s arm entry, 2 s baseline, "
+                f"10 s at {0.0 if runtime is not None and runtime.stationary else 0.5} m/s, "
+                "3 s stop-settle with heading hold, then >=3 s release after zero-speed ack. "
+                "Robot must already be stationary in FSM 500."
+            )
+        print(f"Type exactly: EXECUTE {profile['robot_id']}")
+        reply = input("> ")
+        if reply != f"EXECUTE {profile['robot_id']}" or stop_requested.is_set():
+            raise RuntimeError("confirmation rejected before command output")
+        rc, value = query_fsm_once()
+        if rc != 0 or value != 500:
+            raise RuntimeError(f"final FSM 500 confirmation failed: rc={rc}, FSM={value}")
+        before, _ = streams.latest()
+        initial = startup_gate(
+            streams, interlock, journal, before.sequence,
+            profile["startup_valid_samples_int"],
+        )
+        failure = health(streams, interlock, journal)
+        if failure:
+            raise RuntimeError(f"pre-publisher: {failure}")
+        if not interlock.latch_valid_fsm():
+            raise RuntimeError("could not latch final FSM 500 confirmation")
+        journal.record({
+            "schema": "g1_pid_event_v1", "event": "fsm_runtime_latched",
+            "fsm_id": 500,
+            "reason": "avoid competing synchronous GetFsmId and SetVelocity RPCs; "
+                      "LowState/remote and controller interlocks remain live",
+        })
+
+        # Local construction precedes any command publisher.
+        if runtime is None:
+            controller = RightArmHardwarePid(
+                profile["target_q_array"][5:10], pid_parameters,
+                model=EndpointModel(args.controller_config),
+                control_dt=CONTROL_PERIOD_S,
+                reference_bounds_rad=profile.get('position_pid_reference_bounds_rad'),
+            )
+            plan = HardwarePidPlan(
+                _arm_slots(initial), profile["target_q_array"],
+                profile["kp_array"], profile["kd_array"], controller,
+            )
+        else:
+            plan = runtime.create_plan(_arm_slots(initial), profile)
+            journal.record({'schema':'g1_mpc_event_v1','event':'prepared_field_plan',
+                            'core':getattr(runtime.controller,'metadata',{})})
+            if hasattr(runtime, 'prepare_startup'):
+                runtime.prepare_startup()
+        if interactive_walk is not None:
+            keyboard = SpacebarInput()
+            keyboard.open()
+            journal.record({'schema':'g1_pid_event_v1', 'event':'interactive_walk_enabled',
+                            **INTERACTIVE_WALK_PROTOCOL})
+
+            def keyboard_worker():
+                try:
+                    while not task_started.wait(.01):
+                        if worker_stop.is_set():
+                            return
+                    while not worker_stop.is_set() and not stop_requested.is_set():
+                        keys = keyboard.poll(.05)
+                        if b' ' not in keys:
+                            continue
+                        now_s = (monotonic_ns()-epoch_ns)*1e-9
+                        changed, snapshot, reason = interactive_walk.toggle(now_s)
+                        if changed:
+                            velocity_wakeup.set()
+                        journal.record({'schema':'g1_pid_event_v1', 'event':'space_key',
+                            'task_elapsed_s':now_s, 'accepted':changed, 'reason':reason,
+                            'walk_schedule':snapshot.evidence()})
+                        if changed:
+                            action = 'PAUSED (arms active)' if snapshot.phase == 'paused_hold' else 'RESUMED'
+                            print(f'M10 {action}; walking {snapshot.walking_elapsed_s:.2f}/20.00 s', flush=True)
+                except Exception as exc:
+                    interlock.trip(f'M10 keyboard failure: {exc}', release_blocking=False)
+                    request_stop()
+
+            keyboard_thread = threading.Thread(target=keyboard_worker, name='mpc_keyboard', daemon=True)
+            keyboard_thread.start()
+        # Publisher creation occurs only after both state gates and typed confirmation.
+        publisher = ChannelPublisher("rt/arm_sdk", LowCmd_)
+        publisher.Init()
+        journal.record({
+            "schema": "g1_pid_event_v1", "event": "arm_publisher_created",
+            "topic": "rt/arm_sdk",
+        })
+        epoch_ns = None
+        if runtime is None:
+            # Preserve the established PID startup order.
+            epoch_ns = monotonic_ns()
+            streams.set_epoch(epoch_ns)
+            journal.record({"schema": "g1_pid_event_v1", "event": "task_epoch",
+                            "task_epoch_monotonic_ns": epoch_ns})
+            task_started.set()
+
+        def velocity_worker():
+            nonlocal last_zero_reply_ns
+            client = fsm_client
+            heading_frozen_logged = False
+            try:
+                velocity_ready.set()
+                # Construct RPC on the housekeeping CPUs, but don't let task
+                # time or motion requests advance during MPC initialization.
+                while not task_started.wait(0.01):
+                    if worker_stop.is_set():
+                        return
+                if worker_stop.is_set():
+                    return
+                # This opt-in stationary tool never acquires or refreshes a
+                # locomotion velocity lease.  Repeated SetVelocity(0) calls
+                # add no stopping behavior after the final FSM=500 gate and
+                # can eventually time out, needlessly ending a continuous
+                # arm-only hold.  The regular timed PID/MPC paths are unchanged.
+                if continuous_stationary_hold:
+                    while not worker_stop.is_set() and not stop_requested.is_set():
+                        worker_stop.wait(VELOCITY_RPC_PERIOD_S)
+                    return
+                while not worker_stop.is_set():
+                    if velocity_wakeup is not None:
+                        velocity_wakeup.clear()
+                    iteration = time.monotonic()
+                    task_s = (monotonic_ns() - epoch_ns) * 1e-9
+                    failure_now = health(streams, interlock, journal)
+                    if task_s >= WALK_START_S and not heading_frozen_logged and not failure_now:
+                        yaw0, heading = streams.freeze_heading()
+                        heading_frozen_logged = True
+                        journal.record({
+                            "schema": "g1_pid_event_v1", "event": "heading_reference_frozen",
+                            "task_elapsed_s": task_s, "yaw0_rad": yaw0,
+                            "h0_from_navigation_world_yaw_rad": -yaw0,
+                            "requested_reference_start_s": 3.0,
+                            "requested_reference_end_s": 5.0,
+                            **heading,
+                            "h0_definition": "fixed_run_frame_x_along_pre_walk_mean_yaw_z_vertical",
+                        })
+                    heading = streams.heading_current()
+                    motion = locomotion_setpoint(
+                        task_s,
+                        heading["correction_rad_s"],
+                        inhibited=stop_requested.is_set() or bool(failure_now),
+                    )
+                    if runtime is not None and runtime.stationary:
+                        motion.update(vx_m_s=0.0, yaw_rate_rad_s=0.0,
+                                      walking_active=False, heading_hold_active=False)
+                    # There is no active locomotion lease to refresh before
+                    # the scheduled walk. Repeated zero-speed RPCs here only
+                    # load the synchronous Loco service while the arms enter.
+                    # A requested abort still sends zero immediately below.
+                    if task_s < WALK_START_S and not stop_requested.is_set():
+                        (velocity_wakeup or worker_stop).wait(min(
+                            VELOCITY_RPC_PERIOD_S,
+                            max(0.001, WALK_START_S - task_s),
+                        ))
+                        continue
+                    vx = motion["vx_m_s"]
+                    wz = motion["yaw_rate_rad_s"]
+                    duration = motion["duration_s"]
+                    with loco_rpc_lock:
+                        if interactive_walk is not None:
+                            # Re-read after the RPC lock: a SPACE received during
+                            # a preceding RPC must replace its stale motion intent.
+                            task_s = (monotonic_ns()-epoch_ns)*1e-9
+                            walk_snapshot = interactive_walk.snapshot(task_s)
+                            motion = walk_snapshot.motion(task_s, heading['correction_rad_s'],
+                                inhibited=stop_requested.is_set() or bool(health(streams, interlock, journal)))
+                            vx, wz, duration = (motion['vx_m_s'], motion['yaw_rate_rad_s'], motion['duration_s'])
+                        begin = monotonic_ns()
+                        rc, raw = client.send_velocity(vx, wz, duration)
+                        end = monotonic_ns()
+                    journal.record({
+                        "schema": "g1_pid_event_v1", "event": "velocity_reply",
+                        "task_elapsed_s": task_s, "request_ns": begin, "reply_ns": end,
+                        "return_code": rc, "raw_reply": raw,
+                        "vx_m_s": vx, "vy_m_s": 0.0, "yaw_rate_rad_s": wz,
+                        "duration_s": duration, "zero_command": vx == 0.0 and wz == 0.0,
+                        "walking_active": motion["walking_active"],
+                        "heading_hold_active": motion["heading_hold_active"],
+                        **({'walk_schedule':walk_snapshot.evidence()} if interactive_walk is not None else {}),
+                        **heading,
+                    })
+                    if rc != 0:
+                        velocity_failed.set()
+                        stop_requested.set()
+                        break
+                    if vx == 0.0 and wz == 0.0:
+                        with last_zero_lock:
+                            last_zero_reply_ns = end
+                    delay = max(0.001, VELOCITY_RPC_PERIOD_S - (time.monotonic() - iteration))
+                    (velocity_wakeup or worker_stop).wait(delay)
+            except Exception as exc:
+                velocity_failed.set()
+                stop_requested.set()
+                velocity_ready.set()
+                journal.record({
+                    "schema": "g1_pid_event_v1", "event": "velocity_exception",
+                    "reason": repr(exc),
+                })
+            finally:
+                if client is not None and not continuous_stationary_hold:
+                    try:
+                        with loco_rpc_lock:
+                            begin = monotonic_ns()
+                            rc, raw = client.send_velocity(0.0, 0.0, 0.2)
+                            end = monotonic_ns()
+                        if rc == 0:
+                            with last_zero_lock:
+                                last_zero_reply_ns = end
+                        journal.record({
+                            "schema": "g1_pid_event_v1", "event": "velocity_final_zero",
+                            "request_ns": begin, "reply_ns": end, "return_code": rc,
+                            "raw_reply": raw, "physical_stop_verified": False,
+                        })
+                    except Exception as exc:
+                        velocity_failed.set()
+                        journal.record({
+                            "schema": "g1_pid_event_v1", "event": "velocity_final_zero_exception",
+                            "reason": repr(exc), "physical_stop_verified": False,
+                        })
+                elif client is not None:
+                    journal.record({
+                        "schema": "g1_pid_event_v1",
+                        "event": "velocity_output_not_used",
+                        "reason": "continuous stationary arm-only tool never acquired a velocity lease",
+                    })
+
+        velocity_thread = threading.Thread(target=velocity_worker, name="pid_velocity", daemon=True)
+        velocity_thread.start()
+        if runtime is not None:
+            if not velocity_ready.wait(2.0) or velocity_failed.is_set():
+                raise RuntimeError('velocity client startup failed before MPC task epoch')
+        scheduling = (runtime.enter_control_thread(args.cpu)
+                      if runtime is not None and hasattr(runtime, 'enter_control_thread')
+                      else pin_control_thread(args.cpu))
+        journal.record({"schema": "g1_pid_event_v1", "event": "control_runtime", **scheduling})
+        if runtime is not None:
+            failure = health(streams, interlock, journal)
+            if failure or stop_requested.is_set():
+                raise RuntimeError(failure or 'stopped before MPC task epoch')
+            # GC, RPC construction, affinity/FIFO and host inspection are now
+            # finished. Only then anchor the predictor and the task schedule.
+            epoch_ns = monotonic_ns()
+            streams.set_epoch(epoch_ns)
+            runtime.set_epoch(epoch_ns)
+            journal.record({"schema": "g1_pid_event_v1", "event": "task_epoch",
+                            "task_epoch_monotonic_ns": epoch_ns})
+            task_started.set()
+        clock = PeriodicClock(monotonic_ns(), CONTROL_PERIOD_S)
+        last_iteration_ns = None
+        previous_low_ns = previous_imu_ns = None
+        abort_start_s = None
+        abort_start_ns = None
+        abort_release_start_s = None
+        abort_weight = None
+        abort_reason = None
+        abort_q = None
+        abort_release_ramp = None
+        normal_release_start_s = None
+        normal_zero_acknowledged = False
+        last_stage = None
+        while True:
+            clock.wait()
+            loop_begin_ns = monotonic_ns()
+            actual_dt = CONTROL_PERIOD_S if last_iteration_ns is None else (loop_begin_ns - last_iteration_ns) * 1e-9
+            task_s = (loop_begin_ns - epoch_ns) * 1e-9
+            walk_snapshot = interactive_walk.snapshot(task_s) if interactive_walk is not None else None
+            plan_task_s = task_s if walk_snapshot is None else walk_snapshot.plan_time_s
+            scheduled_release_s = RELEASE_START_S if walk_snapshot is None else walk_snapshot.release_start_s
+            failure = health(streams, interlock, journal)
+            if failure:
+                raise RuntimeError(failure)
+            low, imu = streams.latest()
+            if stop_requested.is_set() and abort_start_s is None:
+                abort_start_s = task_s
+                abort_start_ns = loop_begin_ns
+                abort_q = (
+                    np.asarray(last_frame["q_rad"], dtype=float).copy()
+                    if last_frame is not None else _arm_slots(low)
+                )
+                abort_weight = (
+                    float(last_frame["weight"]) if last_frame is not None else 0.0
+                )
+                abort_reason = (
+                    "velocity_rpc_failure" if velocity_failed.is_set()
+                    else "operator_stop"
+                )
+                journal.record({
+                    "schema": "g1_pid_event_v1", "event": "operator_stop_requested",
+                    "task_elapsed_s": task_s, "reason": abort_reason,
+                    "release_start_weight": abort_weight,
+                })
+            heading = streams.heading_current()
+            yaw0 = heading["reference_rad"] if heading["reference_frozen"] else 0.0
+            controller_begin_ns = monotonic_ns()
+            scheduled_control_active = (
+                scheduled_release_s is None or task_s < scheduled_release_s or continuous_stationary_hold
+            )
+            if runtime is not None and abort_start_s is None and scheduled_control_active:
+                runtime.prepare(monotonic_ns(), low, imu, yaw0, task_s,
+                                heading_frozen=heading["reference_frozen"])
+            if abort_start_s is None:
+                if scheduled_control_active:
+                    frame = plan.sample(
+                        plan_task_s, _arm_slots(low), _arm_dq(low), imu.quaternion,
+                        yaw0, actual_dt,
+                    )
+                else:
+                    with last_zero_lock:
+                        zero_reply = last_zero_reply_ns
+                    zero_after_heading = zero_reply >= (
+                        epoch_ns + int(scheduled_release_s * 1e9)
+                    )
+                    zero_ack_timed_out = (
+                        task_s - scheduled_release_s >= ZERO_SPEED_ACK_WAIT_S
+                    )
+                    if (
+                        normal_release_start_s is None
+                        and (zero_after_heading or zero_ack_timed_out)
+                    ):
+                        normal_release_start_s = task_s
+                        normal_zero_acknowledged = zero_after_heading
+                        journal.record({
+                            "schema": "g1_pid_event_v1",
+                            "event": "normal_weight_release_started",
+                            "task_elapsed_s": task_s,
+                            "duration_s": WEIGHT_RELEASE_DURATION_S,
+                            "zero_velocity_reply_ns": zero_reply,
+                            "zero_velocity_acknowledged": zero_after_heading,
+                            "zero_velocity_ack_wait_s": task_s - scheduled_release_s,
+                        })
+                    if normal_release_start_s is None:
+                        held_q = (
+                            np.asarray(last_frame["q_rad"], dtype=float).copy()
+                            if last_frame is not None else _arm_slots(low)
+                        )
+                        held_weight = (
+                            float(last_frame["weight"])
+                            if last_frame is not None else 1.0
+                        )
+                        frame = {
+                            "stage": "normal_stop_wait",
+                            "q_rad": held_q,
+                            "dq_rad_s": np.zeros(13),
+                            "kp": profile["kp_array"],
+                            "kd": profile["kd_array"],
+                            "weight": held_weight,
+                            "terminal": False,
+                            "diagnostics": {
+                                "pid_active": False,
+                                "zero_velocity_ack_wait": True,
+                            },
+                        }
+                    else:
+                        release_task_s = (
+                            RELEASE_START_S + task_s - normal_release_start_s
+                        )
+                        if runtime is not None and getattr(runtime, 'field_trial', False):
+                            frame = runtime.release_frame(task_s-normal_release_start_s)
+                        else:
+                            frame = plan.sample(
+                                release_task_s, _arm_slots(low), _arm_dq(low),
+                                imu.quaternion, yaw0, actual_dt,
+                            )
+                        frame["diagnostics"] = {
+                            **frame["diagnostics"],
+                            "normal_release_elapsed_s": (
+                                task_s - normal_release_start_s
+                            ),
+                            "zero_velocity_acknowledged": (
+                                normal_zero_acknowledged
+                            ),
+                        }
+            else:
+                with last_zero_lock:
+                    zero_reply = last_zero_reply_ns
+                zero_acknowledged = zero_reply >= abort_start_ns
+                # Stop velocity requests run independently. A missing Loco
+                # acknowledgement must not delay the arm hand-back.
+                if abort_release_start_s is None:
+                    abort_release_start_s = task_s
+                    abort_release_ramp = WeightReleaseRamp(
+                        abort_weight, CONTROL_PERIOD_S
+                    )
+                    journal.record({
+                        "schema": "g1_pid_event_v1",
+                        "event": "abort_weight_release_started",
+                        "task_elapsed_s": task_s,
+                        "reason": abort_reason,
+                        "start_weight": abort_weight,
+                        "duration_s": WEIGHT_RELEASE_DURATION_S,
+                        "zero_velocity_reply_ns": zero_reply,
+                        "zero_velocity_acknowledged": zero_acknowledged,
+                        "zero_velocity_ack_wait_s": task_s - abort_start_s,
+                    })
+                if abort_release_start_s is None:
+                    release_weight = abort_weight
+                    terminal = False
+                    release_stage = "operator_stop_wait"
+                    release_elapsed_s = 0.0
+                else:
+                    release_elapsed_s = task_s - abort_release_start_s
+                    release_weight, terminal = abort_release_ramp.sample(
+                        release_elapsed_s
+                    )
+                    release_stage = "operator_arm_release"
+                frame = {
+                    "stage": release_stage,
+                    "q_rad": abort_q.copy(), "dq_rad_s": np.zeros(13),
+                    "kp": profile["kp_array"], "kd": profile["kd_array"],
+                    "weight": release_weight,
+                    "terminal": terminal,
+                    "diagnostics": {
+                        "pid_active": False,
+                        "operator_stop": True,
+                        "release_reason": abort_reason,
+                        "release_elapsed_s": release_elapsed_s,
+                    },
+                }
+            if walk_snapshot is not None:
+                frame['diagnostics']['walk_schedule'] = walk_snapshot.evidence()
+                if abort_start_s is None and scheduled_control_active:
+                    frame['stage'] = walk_snapshot.phase
+            if runtime is not None and runtime.stationary:
+                frame["stage"] = {"forward_walk": "stationary_hold",
+                                  "stop_settle": "stationary_hold_tail"}.get(frame["stage"], frame["stage"])
+            controller_end_ns = monotonic_ns()
+            if frame["stage"] != last_stage:
+                journal.record({
+                    "schema": "g1_pid_event_v1", "event": "task_stage",
+                    "stage": frame["stage"], "task_elapsed_s": task_s,
+                })
+                print(f"t={task_s:.3f} {frame['stage']}")
+                last_stage = frame["stage"]
+            message = make_message(frame, low)
+            failure = health(streams, interlock, journal)
+            prewrite_check_ns = monotonic_ns()
+            if failure or prewrite_check_ns - min(low.received_ns, imu.received_ns) > STATE_TIMEOUT_NS:
+                raise RuntimeError(failure or "selected feedback stale before write")
+            if runtime is not None and hasattr(runtime, 'check_before_write'):
+                if getattr(runtime, 'timing_grace', None) is not None:
+                    # A tolerant timing path must re-evaluate the unchanged
+                    # packet against a current snapshot, not relabel old data.
+                    latest = streams.latest()
+                    runtime.check_before_write(frame, low, imu, loop_begin_ns,
+                                               monotonic_ns(), latest=latest)
+                else:
+                    runtime.check_before_write(frame, low, imu, loop_begin_ns, prewrite_check_ns)
+            write_begin_ns = monotonic_ns()
+            try:
+                ok = bool(publisher.Write(message))
+            except Exception:
+                publisher_transport_failed = True
+                raise
+            write_end_ns = monotonic_ns()
+            if not ok:
+                publisher_transport_failed = True
+            else:
+                # Latch the successfully sent command BEFORE logging or other
+                # fallible bookkeeping. A logging error must not hand back from
+                # a stale command after a newer one has already left the host.
+                last_frame = {
+                    'q_rad':np.asarray(frame['q_rad'],dtype=float).copy(),
+                    'dq_rad_s':np.asarray(frame['dq_rad_s'],dtype=float).copy(),
+                    'kp':np.asarray(frame['kp'],dtype=float).copy(),
+                    'kd':np.asarray(frame['kd'],dtype=float).copy(),
+                    'weight':float(frame['weight']),
+                }
+                last_state = low
+                if runtime is not None and hasattr(runtime,'accept_packet'):
+                    runtime.accept_packet(frame,message)
+            sequence += 1
+            journal.record({
+                "schema": "g1_hardware_pid_command_v1", "event": "dds_write" if ok else "dds_write_failed",
+                "sequence": sequence, "task_elapsed_s": task_s, "stage": frame["stage"],
+                "weight": frame["weight"], "q_command_rad": frame["q_rad"].tolist(),
+                "dq_command_rad_s": frame["dq_rad_s"].tolist(),
+                "kp_command": frame["kp"].tolist(), "kd_command": frame["kd"].tolist(),
+                "command_crc": int(message.crc), "mode_pr": int(message.mode_pr),
+                "mode_machine": int(message.mode_machine),
+                "q_measured_rad": _arm_slots(low).tolist(),
+                "dq_measured_rad_s": _arm_dq(low).tolist(),
+                "state_received_monotonic_ns": low.received_ns,
+                "imu_received_monotonic_ns": imu.received_ns,
+                "yaw0_rad": yaw0, "heading_reference_frozen": heading["reference_frozen"],
+                "control_nominal_period_ms": CONTROL_PERIOD_S * 1000.0,
+                "control_actual_period_ms": None if last_iteration_ns is None else actual_dt * 1000,
+                "controller_compute_us": (controller_end_ns - controller_begin_ns) * 1e-3,
+                "control_prewrite_us": (write_begin_ns - loop_begin_ns) * 1e-3,
+                "write_begin_monotonic_ns": write_begin_ns,
+                "write_end_monotonic_ns": write_end_ns,
+                "write_duration_us": (write_end_ns - write_begin_ns) * 1e-3,
+                **frame["diagnostics"],
+                **execution_evidence(message, low),
+            })
+            if not ok:
+                raise RuntimeError("arm DDS write failed")
+            work_end_ns = monotonic_ns()
+            scheduled_ns = clock.scheduled_ns
+            skipped_slots = clock.advance(work_end_ns)
+            cycle_timing = {
+                "schema": "g1_pid_timing_v1", "sequence": sequence,
+                "task_elapsed_s": task_s, "stage": frame["stage"],
+                "scheduled_monotonic_ns": scheduled_ns,
+                "loop_begin_monotonic_ns": loop_begin_ns,
+                "work_end_monotonic_ns": work_end_ns,
+                "nominal_period_ms": CONTROL_PERIOD_S * 1000,
+                "actual_period_ms": None if last_iteration_ns is None else actual_dt * 1000,
+                "wake_lateness_ms": (loop_begin_ns - scheduled_ns) * 1e-6,
+                "work_ms": (work_end_ns - loop_begin_ns) * 1e-6,
+                "deadline_missed": work_end_ns > scheduled_ns + clock.period_ns,
+                "skipped_slots": skipped_slots,
+                "state_age_at_write_ms": (write_end_ns - low.received_ns) * 1e-6,
+                "imu_age_at_write_ms": (write_end_ns - imu.received_ns) * 1e-6,
+                "state_imu_skew_ms": abs(low.received_ns - imu.received_ns) * 1e-6,
+                "reused_lowstate": low.received_ns == previous_low_ns,
+                "reused_imu": imu.received_ns == previous_imu_ns,
+                "write_ms": (write_end_ns - write_begin_ns) * 1e-6,
+            }
+            journal.record(cycle_timing)
+            if runtime is not None:
+                complete_ns = monotonic_ns()
+                if complete_ns >= clock.scheduled_ns:
+                    extra_skipped = (complete_ns-clock.scheduled_ns)//clock.period_ns+1
+                    clock.scheduled_ns += extra_skipped*clock.period_ns
+                    clock.skipped_slots += extra_skipped
+                    cycle_timing["skipped_slots"] += extra_skipped
+                cycle_timing.update(
+                    complete_work_ms=(complete_ns - loop_begin_ns) * 1e-6,
+                    complete_deadline_missed=complete_ns > scheduled_ns + clock.period_ns,
+                )
+                journal.record({
+                    **cycle_timing, "schema": "g1_mpc_cycle_complete_v1",
+                    "scope": "through timing-row enqueue; excludes this final audit-row enqueue",
+                })
+            cycle_timings.append(cycle_timing)
+            last_iteration_ns = loop_begin_ns
+            previous_low_ns, previous_imu_ns = low.received_ns, imu.received_ns
+            if frame["terminal"]:
+                break
+
+        worker_stop.set()
+        velocity_thread.join()
+        journal.record({
+            "schema": "g1_pid_event_v1", "event": "session_end",
+            "outcome": ("velocity_fault_release_completed" if velocity_failed.is_set()
+                        else "operator_stop_release_completed") if abort_start_s is not None
+                else "normal_release_completed",
+            "final_weight": 0.0, "physical_stop_verified": False,
+            **({'walk_schedule':interactive_walk.snapshot(task_s).evidence()}
+               if interactive_walk is not None else {}),
+        })
+        return (3 if velocity_failed.is_set() else 130) if abort_start_s is not None else 0
+    except Exception as exc:
+        # First stop requesting motion. Keep LowState/remote monitoring alive
+        # while a catchable software fault attempts a three-second hand-back.
+        stop_requested.set()
+        if runtime is not None:
+            journal.record({"schema": "g1_mpc_event_v1", "event": "controller_fault_detail",
+                            "reason": str(exc), "diagnostics": runtime.controller.last_diagnostics})
+        release_result = fallback_weight_release(str(exc))
+        if release_result['completed']:
+            print('ARM RELEASE COMPLETE weight=0; confirm physical arm hand-back on site',
+                  file=sys.stderr)
+        else:
+            print(f"ARM RELEASE NOT CONFIRMED: {release_result['reason']}; "
+                  'use the verified on-site stop/recovery method before another run', file=sys.stderr)
+        worker_stop.set()
+        if velocity_thread is not None and velocity_thread.is_alive():
+            velocity_thread.join()
+        journal.record({
+            "schema": "g1_pid_event_v1", "event": "session_fault",
+            "reason": str(exc),
+            "fault_release": release_result,
+            "single_frame_weight_zero_attempted": False,
+            "physical_stop_verified": False,
+        })
+        print(f"{controller_label} walk stopped: {exc}", file=sys.stderr)
+        return 3
+    finally:
+        worker_stop.set()
+        fsm_poll_stop.set()
+        if velocity_wakeup is not None:
+            velocity_wakeup.set()
+        for worker in (velocity_thread, fsm_thread, keyboard_thread):
+            if worker is not None and worker.is_alive():
+                worker.join()
+        if keyboard is not None:
+            try:
+                keyboard.close()
+            except Exception as exc:
+                journal.record({'schema':'g1_pid_event_v1', 'event':'keyboard_restore_failed',
+                                'reason':repr(exc)})
+        os.sched_setaffinity(0, original_affinity)
+        journal.record({
+            "schema": "g1_pid_event_v1", "event": "control_timing_summary",
+            "all_normal_loop_stages": timing_summary(cycle_timings),
+            **({'interactive_control': timing_summary([
+                row for row in cycle_timings if row['stage'] in
+                ('forward_walk', 'paused_hold', 'stop_settle')])}
+               if interactive_walk is not None else
+               {'primary_5_18': timing_summary([
+                   row for row in cycle_timings if WALK_START_S <= row['task_elapsed_s'] < RELEASE_START_S])}),
+        })
+        shutdown = {}
+        for name, endpoint, endpoint_kind in (
+            ("low_subscriber", low_subscriber, "subscriber"),
+            ("imu_subscriber", imu_subscriber, "subscriber"),
+            ("arm_publisher", publisher, "publisher"),
+        ):
+            if endpoint is None:
+                shutdown[name] = "not_created"
+                continue
+            try:
+                shutdown[name] = close_sdk_endpoint(endpoint, endpoint_kind)
+            except Exception as exc:
+                shutdown[name] = f"close_failed: {exc}"
+        journal.record({
+            "schema": "g1_pid_event_v1", "event": "sdk_shutdown",
+            "endpoints": shutdown,
+        })
+        if previous_sigint is not None:
+            signal.signal(signal.SIGINT, previous_sigint)
+        if previous_sigterm is not None:
+            signal.signal(signal.SIGTERM, previous_sigterm)
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("nic", nargs='?', help="robot-facing wired network interface; omitted only for preflight")
+    parser.add_argument("--profile", required=True, type=Path)
+    parser.add_argument("--controller-config", type=Path, default=ROOT / "configs/g1.yaml")
+    parser.add_argument("--output-dir", type=Path,
+                        help="new directory; raw.jsonl and exact inputs are stored here")
+    parser.add_argument("--permit-real-output", choices=[PERMIT])
+    parser.add_argument('--preflight', action='store_true', help='zero-position PID offline checks; never initialize DDS')
+    parser.add_argument('--zero-arm-neutral', action='store_true', help='explicit zero-neutral position PID experiment')
+    parser.add_argument('--position-pid-config', type=Path, help='reviewed zero-neutral reference-box/governor config')
+    parser.add_argument("--cpu", type=int, default=None,
+                        help="control thread CPU (default CPU 7 if available, else first allowed)")
+    parser.add_argument("--allow-first-6ms-field-trial", action="store_true",
+                        help="explicit one-run opt-in; does not declare 6 ms field validation passed")
+    return parser
+
+
+def main(argv=None):
+    args = build_parser().parse_args(argv)
+    journal = None
+    try:
+        if not args.preflight and not (args.nic and args.output_dir and args.permit_real_output == PERMIT):
+            raise ValueError('real PID output requires NIC, new output directory and exact output permit')
+        if bool(args.zero_arm_neutral) != (args.position_pid_config is not None):
+            raise ValueError('zero position PID requires both --zero-arm-neutral and --position-pid-config')
+        if args.preflight and not args.zero_arm_neutral:
+            raise ValueError('this preflight is specific to the explicit zero-position PID experiment')
+        profile = load_profile(args.profile)
+        if args.zero_arm_neutral:
+            from hardware_position_pid_zero import prepare_profile
+            profile = prepare_profile(profile, args.position_pid_config, args.controller_config)
+        pid_parameters, pid_mapping = load_pid_parameters(args.controller_config, profile)
+        if args.zero_arm_neutral:
+            pid_mapping['position_pid_reference_experiment'] = profile['position_pid_reference_experiment']
+        if args.preflight:
+            from hardware_position_pid_zero import preflight
+            print(json.dumps(preflight(profile, pid_parameters, args.controller_config), indent=2))
+            return 0
+        if FIELD_OUTPUT_LOCKED and not args.allow_first_6ms_field_trial:
+            raise RuntimeError(
+                "6 ms hardware PID output locked pending first field validation; "
+                "use --allow-first-6ms-field-trial only for the supervised first trial; "
+                "20 ms baseline is preserved in Git"
+            )
+        from field_performance import prepare as prepare_field_performance
+        allowed = sorted(os.sched_getaffinity(0))
+        selected_cpu = (7 if 7 in allowed else allowed[0]) if args.cpu is None else args.cpu
+        performance_setup = prepare_field_performance(selected_cpu)
+        journal = Journal(args.output_dir)
+        shutil.copy2(args.profile, args.output_dir / "arm_profile.conf")
+        shutil.copy2(args.controller_config, args.output_dir / "controller_config.yaml")
+        if args.zero_arm_neutral:
+            shutil.copy2(args.position_pid_config, args.output_dir/'position_pid_config.yaml')
+            (args.output_dir/'effective_profile.json').write_text(json.dumps(json_safe(profile), indent=2)+'\n')
+            print('EXPERIMENT: zero-neutral POSITION PID; original feedback gains; '
+                  f'reference limits {pid_parameters.hardware_max_dq:g} rad/s, '
+                  f'{pid_parameters.hardware_max_ddq:g} rad/s^2; '
+                  'explicit absolute reference box preserves the old negative pitch/elbow command range.')
+        journal.record({
+            "schema": "g1_pid_session_v1", "event": "session_start",
+            "program": "g1_walk_pid.py", "publisher_created": False,
+            "mode_setter_registered": False, "lowcmd_topic_created": False,
+            "network_interface": args.nic, "required_fsm": 500,
+            "walk_start_s": WALK_START_S, "walk_stop_s": WALK_STOP_S,
+            "release_start_s": RELEASE_START_S, "end_s": END_S,
+            "primary_metric_window_s": [WALK_START_S, RELEASE_START_S],
+            "primary_metric_scope": "walk_start_through_stop_settle_end",
+            "forward_speed_m_s": FORWARD_SPEED_M_S,
+            "heading_target": "fixed_run_h0_positive_x",
+            "heading_hold_start_s": WALK_START_S,
+            "heading_hold_stop_s": RELEASE_START_S,
+            "forward_walk_stop_s": WALK_STOP_S,
+            "pid_parameters": pid_mapping,
+            "control_nominal_period_ms": CONTROL_PERIOD_S * 1000,
+            "profile_declared_period_ms": float(profile["control_period_ms"]),
+            "first_6ms_field_trial_opt_in": args.allow_first_6ms_field_trial,
+            "performance_setup": performance_setup,
+            "pid_physical_reference_period_ms": PID_REFERENCE_PERIOD_S * 1000,
+            "derivative_alpha_at_nominal_period": 1 - (1 - pid_parameters.de_g_alpha) ** (CONTROL_PERIOD_S / PID_REFERENCE_PERIOD_S),
+            "jacobian_method": "analytic_mujoco_site",
+            "control_source_sha256": {
+                str(path.relative_to(ROOT)): hashlib.sha256(path.read_bytes()).hexdigest()
+                for path in (
+                    Path(__file__), ROOT / "arm_pid.py",
+                    Path(__file__).with_name("hardware_pid_control.py"),
+                    Path(__file__).with_name("endpoint_pose.py"),
+                    Path(__file__).with_name("pid_timing.py"),
+                    Path(__file__).with_name("field_performance.py"),
+                )
+            },
+            "profile_sha256": hashlib.sha256(args.profile.read_bytes()).hexdigest(),
+            "controller_config_sha256": hashlib.sha256(args.controller_config.read_bytes()).hexdigest(),
+            **({
+                'zero_arm_neutral_experiment': profile['zero_arm_neutral_experiment'],
+                'position_pid_reference_experiment': profile['position_pid_reference_experiment'],
+                'position_pid_config_sha256': hashlib.sha256(args.position_pid_config.read_bytes()).hexdigest(),
+                'zero_position_pid_source_sha256': hashlib.sha256(
+                    Path(__file__).with_name('hardware_position_pid_zero.py').read_bytes()).hexdigest(),
+            } if args.zero_arm_neutral else {}),
+        })
+        result = run_device(args, profile, pid_parameters, pid_mapping, journal)
+        journal.record({
+            "schema": "g1_pid_event_v1", "event": "capture_drained",
+            "queue_dropped": journal.dropped,
+        })
+        journal.close()
+        if journal.failed.is_set():
+            print(f"PID capture incomplete: {journal.failure_reason}; inspect {args.output_dir}", file=sys.stderr)
+            return 3
+        print(f"Saved PID raw capture: {args.output_dir / 'raw.jsonl'}; records={journal.written}")
+        return result
+    except Exception as exc:
+        print(f"PID walk refused/failed: {exc}", file=sys.stderr)
+        return 1
+    finally:
+        if journal is not None:
+            journal.close()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

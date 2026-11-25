@@ -1,0 +1,23 @@
+# Python caches and local editor settings
+__pycache__/
+*.pyc
+*.pyo
+.vscode/
+.idea/
+.DS_Store
+
+# Generated experiment data and local model artifacts
+evaluation/
+sweep_logs/
+disturbance_template/data/*
+# Frozen compatibility assets referenced by the supplied default configuration
+!disturbance_template/data/full_task_template_v2/
+disturbance_template/data/full_task_template_v2/*
+!disturbance_template/data/full_task_template_v2/20260815_162850/
+disturbance_template/artifacts/
+
+# Rebuildable native libraries and executables
+/build/
+
+# Printer-specific slices; retain editable CAD and generic geometry
+cad/*.gcode.3mf
