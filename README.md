@@ -4,7 +4,7 @@ Model predictive control for keeping a Unitree G1 arm upright during locomotion 
 
 **[▶ Download the full comparison video (13 seconds, MP4)](https://github.com/jiakefu9-hub/g1-arm-mpc/raw/refs/heads/main/media/simulation_hardware_comparison.mp4)**
 
-[![Six-second simulation and hardware comparison preview](https://raw.githubusercontent.com/jiakefu9-hub/g1-arm-mpc/main/media/comparison_preview.gif?preview=compact)](https://github.com/jiakefu9-hub/g1-arm-mpc/raw/refs/heads/main/media/simulation_hardware_comparison.mp4)
+[![Six-second simulation and hardware comparison preview](https://raw.githubusercontent.com/jiakefu9-hub/g1-arm-mpc/main/media/comparison_preview.webp)](https://github.com/jiakefu9-hub/g1-arm-mpc/raw/refs/heads/main/media/simulation_hardware_comparison.mp4)
 
 *Six-second animated preview. If the image does not load, use the video download link above.*
 
