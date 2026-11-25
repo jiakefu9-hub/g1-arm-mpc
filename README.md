@@ -2,9 +2,13 @@
 
 Model predictive control for keeping a Unitree G1 arm upright during locomotion while limiting end-effector motion. The arm controller works alongside the existing locomotion controller and uses torso IMU feedback, joint states, and predicted torso motion.
 
-[![Simulation and hardware comparison](media/comparison_preview.gif)](media/simulation_hardware_comparison.mp4)
+**[▶ Download the full comparison video (13 seconds, MP4)](https://github.com/jiakefu9-hub/g1-arm-mpc/raw/refs/heads/main/media/simulation_hardware_comparison.mp4)**
 
-**Click the six-second preview to open the full 13-second video.** Top: MuJoCo simulation. Bottom: hardware experiments. Columns, from left to right: position PID, MPC without future preview, and MPC with torso-motion preview. Gray guides in simulation show the world vertical. Every left arm uses fixed-joint-angle PD as a reference; the right arm uses the method named above its column. The physical tubes help visualize direction; they are not precision alignment references.
+[![Six-second simulation and hardware comparison preview](https://raw.githubusercontent.com/jiakefu9-hub/g1-arm-mpc/main/media/comparison_preview.gif?preview=compact)](https://github.com/jiakefu9-hub/g1-arm-mpc/raw/refs/heads/main/media/simulation_hardware_comparison.mp4)
+
+*Six-second animated preview. If the image does not load, use the video download link above.*
+
+Top: MuJoCo simulation. Bottom: hardware experiments. Columns, from left to right: position PID, MPC without future preview, and MPC with torso-motion preview. Gray guides in simulation show the world vertical. Every left arm uses fixed-joint-angle PD as a reference; the right arm uses the method named above its column. The physical tubes help visualize direction; they are not precision alignment references.
 
 ## What the controller does
 
